@@ -12,6 +12,7 @@
 from typing import Optional
 from datetime import datetime, timedelta, timezone
 import json
+from json import JSONDecodeError
 from sos.report.plugins import Plugin, IndependentPlugin, PluginOpt
 
 
@@ -79,26 +80,32 @@ class Loki(Plugin, IndependentPlugin):
     def get_logs(self, endpoint, label, start: Optional[datetime],
                  end: Optional[datetime]):
         output = self.exec_cmd(self.query_command(endpoint, label, start, end))
-        print(f"get_logs output: {output}")
-        logs = json.loads(output["output"])
-        return logs
+        try:
+            return json.loads(output["output"])
+        except JSONDecodeError:
+            self._log_warn((f"An error was returned from Loki API on label "
+                            f"{label}. "
+                            f"Storing the error message and not paginating."))
+            return output["output"]
 
     def get_earliest_log_timestamp(self, logs):
         log_streams = logs["data"]["result"]
         # use now as a comparison
         earliest_log = int(datetime.now().timestamp()*1_000_000_000)
-        print(f"Earliest log search started")
         for stream in log_streams:
             for log in stream["values"]:
                 timestamp = int(log[0])
                 earliest_log = min(earliest_log, timestamp)
-        print(f"Found earliest log: {earliest_log}")
         return earliest_log
 
     def get_logs_for_label(self, endpoint, label, paginate):
         logs = self.get_logs(endpoint, label, None, None)
         with self.collection_file(f'{label}.log') as logfile:
             logfile.write(json.dumps(logs, indent=2))
+        if type(logs) is str:
+            # don't paginate if error was returned
+            return
+            
         if paginate:
             earliest_log = self.get_earliest_log_timestamp(logs)
             previous_earliest_log = int(
@@ -107,17 +114,18 @@ class Loki(Plugin, IndependentPlugin):
             iterations_count = 0
             while iterations_count < Loki.MAX_PAGINATION_ITERATIONS and \
                     earliest_log < previous_earliest_log:
-                print(f"Iteration {iterations_count}")
                 log_timestamp = datetime.fromtimestamp(
                                     earliest_log / 1_000_000_000)
                 new_logs = self.get_logs(endpoint, label, None, log_timestamp)
-                print(f"New logs: {new_logs}")
-                previous_earliest_log = earliest_log
-                earliest_log = \
-                    self.get_earliest_log_timestamp(new_logs)
                 with self.collection_file(f'{label}.log.{iterations_count}') \
                         as logfile:
                     logfile.write(json.dumps(new_logs, indent=2))
+                if type(new_logs) is str:
+                    # don't paginate further if error was returned
+                    return
+                previous_earliest_log = earliest_log
+                earliest_log = \
+                    self.get_earliest_log_timestamp(new_logs)
                 # exit at most after 100 pages to avoid infinite loops
                 iterations_count += 1
 
@@ -150,7 +158,6 @@ class Loki(Plugin, IndependentPlugin):
         endpoint = self.get_option("endpoint") or "http://localhost:3100"
         for label in self.labels:
             paginate = self.get_option("paginate")
-            print(f"Collecting logs for label {label}, paginate: {paginate}")
             self.get_logs_for_label(endpoint, label, paginate)
 
     def postproc(self):
